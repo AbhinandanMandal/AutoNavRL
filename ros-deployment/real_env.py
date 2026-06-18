@@ -1,3 +1,18 @@
+
+"""
+This is for actually physical world testing
+-------------------------------------------------------------------------
+RL directly dosen't communicate with environment
+First it takes the input from 'REAL_ENV' of real_env.py
+Secondly the inputs from 'REAL_ENV' goes into 'RobotNavEnv' (env.py) which wraps gym environment, which
+- Converts the simulator's outputs into a fixed-size observation space
+    - Defines a continuous action space for linear and angular velocities
+    - Handles state normalization and preprocessing
+    - Manages episode termination conditions
+
+Then output of RobotNavEnv goes into run.py that helps robot to actually move using RL algorithm
+"""
+
 #!/usr/bin/env python
 import rospy
 import numpy as np
