@@ -1,6 +1,7 @@
 
 """
 This is for training robot with RL algorithm before testing on physical world
+---------------------------------------------------------------------------------
 At first we put charactics of physical world into 'robot_world.yaml'
 Using 'robot_world.yaml' this sim.py creates a simulation environment and take readings
 The output of 'SIM_ENV' (sim.py) goes into 'RobotNavEnv' (train.py) for training specific algorithm
