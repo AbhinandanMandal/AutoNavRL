@@ -8,6 +8,29 @@ The output of 'SIM_ENV' (sim.py) goes into 'RobotNavEnv' (train.py) for training
 Then in 'run.py' we can train the simulation to actually see the performances. 
 """
 
+"""
+1. robot_world.yaml  ->  world geometry / sensor config
+2. SIM_ENV (this file)  ->  simulation step + A*-planned waypoints
+3. RobotNavEnv (train.py)  ->  Gym wrapper consumed by stable-baselines3
+4. run.py  ->  evaluation loop
+"""
+
+"""
+
+A* integration
+--------------
+At every reset() the AStarPlanner rasterises current obstacle positions and
+plans a waypoint path from the robot's start to the final goal.  The waypoints
+are exposed via ``self.waypoints`` and ``self.current_waypoint_index``.
+ 
+During each step() the *active* target is the next waypoint, not the distant
+final goal.  When the robot arrives within ``waypoint_radius`` of the current
+waypoint it advances to the next one.  When the last waypoint (== the final
+goal) is reached irsim reports ``robot.arrive = True`` as usual.
+ 
+``self.current_target`` always returns the (x, y) the reward shaper should
+aim at — train.py reads this instead of the raw goal.
+"""
 
 import numpy as np
 import random
@@ -15,13 +38,33 @@ import shapely
 from irsim.lib.handler.geometry_handler import GeometryFactory
 from irsim.env import EnvBase
 
+from astar_planner import AStarPlanner
+
 
 class SIM_ENV:
     """
     Simulator environment wrapper for robot navigation.
     
-    This class provides a high-level interface for robot navigation simulation,
-    handling state tracking, reward calculation, and environment interactions.
+    New public attributes (A* integration)
+    ---------------------------------------
+    planner : AStarPlanner
+              The grid-based A* planner instance.
+
+    waypoints : list of (float, float)
+                World-coordinate waypoints from start → final goal, planned at each
+                reset().  Empty until the first reset() call.
+
+    current_waypoint_index : int
+                             Index of the waypoint the robot is currently heading toward.
+
+    waypoint_radius : float
+                      Distance (metres) at which the robot is considered to have reached a
+                      waypoint and advances to the next one.
+
+    current_target : (float, float)
+                     The (x, y) position the robot should aim at right now.  Equals
+                    ``waypoints[current_waypoint_index]`` if waypoints exist, otherwise
+                      falls back to the final goal position.
     """
     
     def __init__(self, world_file="robot_world.yaml", render=False):
@@ -35,29 +78,103 @@ class SIM_ENV:
         # Initialize environment
         self.env = EnvBase(world_file, display=render, disable_all_plot=not render)
         self.robot_goal = self.env.get_robot_info(0).goal
+
+        # A* planner - parameters match the 6x6 robot world and specs 
+        self.planner = AStarPlanner(
+            world_w=6.0, world_h=6.0, cell_size=0.15, robot_radius=0.34, inflation_margin=0.12
+        )
+
+        # waypoint stats
+        self.waypoints:list=[]
+        self.current_waypoint_index:int=0
+        self.waypoint_radius:float = 0.45 
         
         # Initialize tracking variables
         self._reset_tracking()
+
+    # Current target of the robot
+    @property
+    def current_target(self):
+        """ 
+        Active (x,y) sub-goal of the robot that it should steer toward.
+        It returns the next un-reached waypoint
+        """
+        if self.waypoints and self.current_waypoint_index < len(self.waypoints):
+            return self.waypoints[self.current_waypoint_index]
+        
+        # If not then returns this
+        return (self.robot_goal[0].item(), self.robot_goal[1].item())
+    
 
     def _reset_tracking(self):
         """Reset tracking variables for distance and angle differences."""
         self.prev_distance = None
         self.prev_diff_rad = None
 
+
+    # Path planning internal helpers to make path from start to goal
+    def _plan_path(self, start_xy, goal_xy):
+        """
+        Build the occupancy grid from current obstacles and run A*.
+ 
+        Called inside reset() after obstacle positions are finalised.
+        Populates ``self.waypoints`` and resets ``self.current_waypoint_index``.
+        """
+        self.planner.build_grid(self.env.obstacle_list)
+        self.waypoints = self.planner.plan(start_xy, goal_xy)
+        self.current_waypoint_index = 0
+
+        print(
+            f"[A*] Planned {len(self.waypoints)} waypoints from "
+            f"({start_xy[0]:.2f}, {start_xy[1]:.2f}) → "
+            f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})"
+        )
+
+
+    def _advance_waypoint_if_reached(self, robot_xy):
+        """
+        Check whether the robot has reached the current waypoint.
+ 
+        If so, advance the index so the next step uses the following waypoint.
+        Does nothing once all waypoints are consumed (irsim handles final arrival).
+        """
+        if not self.waypoints:
+            return
+        if self.current_waypoint_index >= len(self.waypoints):
+            return
+
+        tx, ty = self.current_target
+        dist = np.hypot(robot_xy[0] - tx, robot_xy[1] - ty)
+        if dist < self.waypoint_radius:
+            self.current_waypoint_index = min(
+                self.current_waypoint_index + 1, len(self.waypoints) - 1
+            )
+    
+
     def _calculate_robot_metrics(self, robot_state):
         """
-        Calculate robot-related metrics including goal vector, distance, and orientation.
+        Compute goal-related metrics against the current waypoint (subgola)
         
         Args:
             robot_state: Current state of the robot [x, y, theta]
             
         Returns:
-            tuple: (goal_vector, distance, cos, sin, diff_rad)
+            goal_vector : list[float, float]
+            distance : float = Distance to the current waypoint.
+            cos, sin : float = Angle between robot heading and waypoint.
+            diff_rad : float = Heading difference between robot and final goal orientation
         """
+
+        target_x, target_y = self.current_target
+
         # Calculate goal vector
+        # goal_vector = [
+        #     self.robot_goal[0].item() - robot_state[0].item(),
+        #     self.robot_goal[1].item() - robot_state[1].item(),
+        # ]
         goal_vector = [
-            self.robot_goal[0].item() - robot_state[0].item(),
-            self.robot_goal[1].item() - robot_state[1].item(),
+            target_x - robot_state[0].item(),
+            target_y - robot_state[1].item(),
         ]
         
         # Calculate angle difference between robot orientation and goal orientation
@@ -82,8 +199,8 @@ class SIM_ENV:
         Returns:
             tuple: (cosine, sine) of the angle between vectors
         """
-        vec1 = vec1 / np.linalg.norm(vec1)
-        vec2 = vec2 / np.linalg.norm(vec2)
+        vec1 = vec1 / (np.linalg.norm(vec1)+1e-9)
+        vec2 = vec2 / (np.linalg.norm(vec2)+1e-9)
         cos = np.dot(vec1, vec2)
         sin = vec1[0] * vec2[1] - vec1[1] * vec2[0]
         return cos, sin
@@ -122,6 +239,7 @@ class SIM_ENV:
         
         return progress_reward + time_penalty + obstacle_penalty + dir_progress + rotation_penalty
 
+
     def step(self, lin_velocity=0.0, ang_velocity=0.1):
         """
         Execute one simulation step.
@@ -141,7 +259,11 @@ class SIM_ENV:
         # Get sensor data
         scan = self.env.get_lidar_scan()
         robot_state = self.env.get_robot_state()
-        
+        robot_xy = [robot_state[0].item(), robot_state[1].item()]
+
+        # Advance waypoint if the robot has reached the current one
+        self._advance_waypoint_if_reached(robot_xy)
+
         # Calculate metrics
         goal_vector, distance, cos, sin, diff_rad = self._calculate_robot_metrics(robot_state)
         
@@ -169,7 +291,7 @@ class SIM_ENV:
 
     def reset(self, robot_state=None, robot_goal=None, random_obstacles=True):
         """
-        Reset the simulation environment.
+        Reset the simulation environment, replan the A* path and return the initial state.
         
         Args:
             robot_state (list): Initial robot state [x, y, theta]
@@ -203,11 +325,18 @@ class SIM_ENV:
         self.env.robot.set_goal(np.array(robot_goal), init=True)
         self.env.reset()
         self.robot_goal = self.env.robot.goal
+
+        # Plan A* path now tha obstacles and goal are finalised
+        start_xy = (robot_state[0][0], robot_state[1][0])
+        goal_xy = (robot_goal[0][0], robot_goal[1][0])
+        self._plan_path(start_xy, goal_xy)
+
         self._reset_tracking()
         
         # Get initial state
         action = [0.0, 0.0]
         return self.step(lin_velocity=action[0], ang_velocity=action[1])
+
 
     def _generate_valid_goal(self):
         """
@@ -229,3 +358,4 @@ class SIM_ENV:
             
             if not any(shapely.intersects(geometry, obj._geometry) for obj in self.env.obstacle_list):
                 return goal
+            
