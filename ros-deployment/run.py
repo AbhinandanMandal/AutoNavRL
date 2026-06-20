@@ -9,16 +9,20 @@ import argparse
 # Global variables for goal tracking
 goal_received = False
 current_goal = None
+model=None
 
 def goal_callback(msg):
     """
     Callback function for processing RViz goal poses.
-    
+
     Args:
         msg (PoseStamped): Goal pose message from RViz
     """
     global goal_received, current_goal
     if msg.header.frame_id == "origin":
+        rospy.logwarn(
+            f"Ignoring goal from frame '{msg.header.frame_id}' (expecting 'origin')"
+        )
         x = msg.pose.position.x
         y = msg.pose.position.y
 
@@ -33,15 +37,18 @@ def goal_callback(msg):
         _, _, yaw = tf_trans.euler_from_quaternion(quaternion)
 
         current_goal = [x, y, yaw]
-        rospy.loginfo(f"Received valid goal: x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.2f}°")
+        rospy.loginfo(
+            f"Received valid goal: x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.2f}°")
         goal_received = True
     else:
-        rospy.logwarn(f"Ignoring goal from frame '{msg.header.frame_id}' (expecting 'origin')")
+        rospy.logwarn(
+            f"Ignoring goal from frame '{msg.header.frame_id}' (expecting 'origin')")
 
+# RL execution
 def run_rl(eval_env, goal):
     """
     Execute the trained policy to reach the specified goal.
-    
+
     Args:
         eval_env (RobotNavEnv): Environment instance
         goal (list): [x, y, yaw] target pose
@@ -50,19 +57,40 @@ def run_rl(eval_env, goal):
     obs = eval_env.reset(goal)
     done = False
     total_reward = 0
+    step_count=0
+
+    n_planned = len(eval_env.sim.waypoints)
+    rospy.loginfo(
+        f"[A*] Starting run: {n_planned} waypoints planned to "
+        f"({goal[0]:.2f}, {goal[1]:.2f})"
+    )
 
     while not done and not rospy.is_shutdown():
         # Get action from trained policy
         action, _states = model.predict(obs, deterministic=True)
         obs, reward, done, info = eval_env.step(action)
         total_reward += reward
+        step_count+=1
+    
+    n_reached = eval_env.sim.current_waypoint_index
+    success = eval_env.sim.goal_reached
 
+    rospy.loginfo("=" * 50)
+    rospy.loginfo(f"Task finished after {step_count} steps")
+    rospy.loginfo(f"  Outcome:           {'SUCCESS' if success else 'FAILED'}")
+    rospy.loginfo(f"  Total reward:      {total_reward:.2f}")
+    rospy.loginfo(f"  Waypoints planned: {n_planned}")
+    rospy.loginfo(f"  Waypoints reached: {n_reached}")
+    if n_planned > 0:
+        rospy.loginfo(
+            f"  Follow rate:       {n_reached / n_planned * 100:.1f}%")
     rospy.loginfo(f"Task finished. Total reward: {total_reward}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run RL navigation with ROS')
     parser.add_argument('--model-path', type=str, default="../../models/td3.zip",
-                       help='Path to the trained model')
+                        help='Path to the trained model')
     args = parser.parse_args()
 
     # Initialize ROS node
@@ -76,8 +104,10 @@ if __name__ == '__main__':
     rospy.Subscriber('/move_base_simple/goal', PoseStamped, goal_callback)
 
     # Initialize environment and main loop
-    rate = rospy.Rate(1)  # 1 Hz
+    # rate = rospy.Rate(1)  # 1 Hz
     eval_env = RobotNavEnv()
+    rate = rospy.Rate(1)  # 1 Hz
+
 
     while not rospy.is_shutdown():
         if goal_received:
