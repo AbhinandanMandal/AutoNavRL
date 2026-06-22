@@ -9,7 +9,8 @@ import argparse
 # Global variables for goal tracking
 goal_received = False
 current_goal = None
-model=None
+model = None
+
 
 def goal_callback(msg):
     """
@@ -45,6 +46,8 @@ def goal_callback(msg):
             f"Ignoring goal from frame '{msg.header.frame_id}' (expecting 'origin')")
 
 # RL execution
+
+
 def run_rl(eval_env, goal):
     """
     Execute the trained policy to reach the specified goal.
@@ -57,7 +60,8 @@ def run_rl(eval_env, goal):
     obs = eval_env.reset(goal)
     done = False
     total_reward = 0
-    step_count=0
+    step_count = 0
+    cv_veto_count = 0
 
     n_planned = len(eval_env.sim.waypoints)
     rospy.loginfo(
@@ -70,20 +74,30 @@ def run_rl(eval_env, goal):
         action, _states = model.predict(obs, deterministic=True)
         obs, reward, done, info = eval_env.step(action)
         total_reward += reward
-        step_count+=1
-    
+        step_count += 1
+
+        # Track how many steps had a CV veto active
+        # (real_env logs veto warnings; here we approximate from scan data)
+        if eval_env.sim._cv is not None:
+            veto, _ = eval_env.sim._cv.get_veto()
+            if veto:
+                cv_veto_count += 1
+
+    # Post-episode telemetry
     n_reached = eval_env.sim.current_waypoint_index
     success = eval_env.sim.goal_reached
 
-    rospy.loginfo("=" * 50)
     rospy.loginfo(f"Task finished after {step_count} steps")
     rospy.loginfo(f"  Outcome:           {'SUCCESS' if success else 'FAILED'}")
     rospy.loginfo(f"  Total reward:      {total_reward:.2f}")
-    rospy.loginfo(f"  Waypoints planned: {n_planned}")
-    rospy.loginfo(f"  Waypoints reached: {n_reached}")
+    rospy.loginfo(f"  A* Waypoints planned: {n_planned}")
+    rospy.loginfo(f"  A* Waypoints reached: {n_reached}")
     if n_planned > 0:
         rospy.loginfo(
             f"  Follow rate:       {n_reached / n_planned * 100:.1f}%")
+        if eval_env.sim._cv is not None:
+            rospy.loginfo(
+                f"  CV veto steps:        {cv_veto_count} / {step_count}")
     rospy.loginfo(f"Task finished. Total reward: {total_reward}")
 
 
@@ -91,6 +105,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run RL navigation with ROS')
     parser.add_argument('--model-path', type=str, default="../../models/td3.zip",
                         help='Path to the trained model')
+    parser.add_argument('--no-cv', action='store_true',
+                        help='Disable CV safety layer (LiDAR + A* only)')
+    parser.add_argument('--no-midas', action='store_true',
+                        help='Use edge-based CV fallback instead of MiDaS')
     args = parser.parse_args()
 
     # Initialize ROS node
@@ -105,9 +123,11 @@ if __name__ == '__main__':
 
     # Initialize environment and main loop
     # rate = rospy.Rate(1)  # 1 Hz
-    eval_env = RobotNavEnv()
+    eval_env = RobotNavEnv(
+        use_cv=not args.no_cv,
+        cv_use_midas=not args.no_midas
+    )
     rate = rospy.Rate(1)  # 1 Hz
-
 
     while not rospy.is_shutdown():
         if goal_received:
