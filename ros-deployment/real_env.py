@@ -36,6 +36,24 @@ A* integration (mirrors the simulation approach in sim.py)
   RL observation always describes the nearest subgoal, giving denser guidance
   - exactly as in the simulation wrapper.
 
+
+CV safety layer
+---------------
+The Qbot front camera feeds CVObstacleDetector which runs MiDaS monocular
+depth estimation (or a lightweight edge fallback) in a background thread.
+ 
+Every step() the CV sector-range estimates are FUSED with the LiDAR scan:
+    fused[i] = min(lidar[i], cv[i])
+The RL policy therefore always receives the most conservative (closest)
+distance estimate per sector, regardless of which sensor saw it.
+ 
+Additionally a CV VETO overrides the RL command whenever the camera detects
+an imminent obstacle (< cv_stop_distance m) in the forward arc.  This is
+the primary OOD safety mechanism: even if the RL policy has never seen this
+type of obstacle during training, the CV veto will steer the robot away.
+ 
+Calibration: the first time both a LiDAR reading and a MiDaS frame are
+available the scale factor is computed automatically inside step().
 """
 
 #!/usr/bin/env python
@@ -50,8 +68,7 @@ from tf.transformations import euler_from_quaternion
 import tf
 
 from astar_planner_ros import AStarPlannerROS
-
-
+from cv_obstacle_detector import CVObstacleDetector
 
 
 def reduce_lidar_scan(scan_array):
@@ -159,14 +176,44 @@ class REAL_ENV:
         using the latest LiDAR scan.  Set to 0 to plan only once at reset().
         20–30 steps (≈ 2–3 s at 10 Hz) is a reasonable value for a dynamic
         environment; use 0 for a mostly static arena.
-    
+
         waypoint_radius : float
             Distance in metres at which the robot is considered to have reached a
             waypoint and the index advances (default 0.45 m).
-                      
+
+    New parameters for CV
+    ---------------------
+    use_cv : bool
+        Enable the camera-based safety layer (default True).
+        Set False to run in pure LiDAR+A* mode (e.g. if camera is unavailable).
+ 
+    cv_stop_distance : float
+        CV veto threshold in metres.  If the camera estimates any obstacle
+        closer than this in the forward arc, the RL command is suppressed and
+        a corrective turn is issued instead (default 0.40 m).
+ 
+    cv_camera_topic : str
+        ROS image topic for the front camera (default /camera/image_raw).
+ 
+    cv_hfov_deg : float
+        Camera horizontal field of view in degrees (default 62.2° for
+        Raspberry Pi Camera V2 / Qbot standard camera).
+ 
+    cv_use_midas : bool
+        Use MiDaS monocular depth model (requires torch, default True).
+        If False or torch is unavailable, falls back to edge-based detection.
+
     """
 
-    def __init__(self, goal_pose=None, replan_interval: int=120, waypoint_radius:float=0.45):
+    def __init__(self, goal_pose=None, replan_interval: int = 120, waypoint_radius: float = 0.45,
+                 # CV parameters
+                 use_cv: bool = True,
+                 cv_stop_distance: float = 0.40,
+                 cv_camera_topic: str = "/camera/image_raw",
+                 cv_hfov_deg: float = 62.2,
+                 cv_use_midas: bool = True,
+                 ):
+        
         """Initialize the real robot environment."""
         # ROS interface
         self.scan_sub = rospy.Subscriber(
@@ -176,7 +223,7 @@ class REAL_ENV:
 
         # Sensors and State variables
         self.latest_scan = []
-        self._raw_scan_msg  =None # full laserscan message for A* grid build
+        self._raw_scan_msg = None  # full laserscan message for A* grid build
         self.robot_pose = [0.0, 0.0]
         self.robot_yaw = 0.0
         self.collision = False
@@ -185,9 +232,9 @@ class REAL_ENV:
 
         # Performance metrics
         self.start_time = time.time()
-        self.path_length = 0
-        self.linear_vel_sum = 0
-        self.angular_vel_sum = 0
+        self.path_length = 0.0
+        self.linear_vel_sum = 0.0
+        self.angular_vel_sum = 0.0
         self.timestep = 0
         self.prev_pose = None
 
@@ -204,15 +251,31 @@ class REAL_ENV:
         self.waypoint_radius: float = waypoint_radius
         self.replan_interval: int = replan_interval
 
-        rospy.sleep(1)  # Initialization wait
+        # CV safety layer
+        self._use_cv = use_cv
+        self._cv_calibrated = False
+        self._cv: CVObstacleDetector = None
 
+        if use_cv:
+            # n_sectors must match the lidar bin count in env.py (state_dim - 9 = 42)
+            self._cv = CVObstacleDetector(
+                hfov_deg=cv_hfov_deg,
+                n_sectors=42,
+                stop_distance=cv_stop_distance,
+                camera_topic=cv_camera_topic,
+                use_midas=cv_use_midas,
+            )
+            self._cv.start()
+            rospy.loginfo("[REAL_ENV] CV obstacle detector started")
+
+        rospy.sleep(1)  # Initialization wait
 
     # current target properties
     @property
     def current_target(self):
         """
         Active (x, y) subgoal for the current step.
- 
+
         Returns the next un-reached waypoint, or the final goal as fallback.
         """
         if self.waypoints and self.current_waypoint_index < len(self.waypoints):
@@ -220,17 +283,16 @@ class REAL_ENV:
         if self.robot_goal is not None:
             return (self.robot_goal[0], self.robot_goal[1])
         return (0.0, 0.0)
-    
 
     # ROS callback
-    def scan_callback(self, data:LaserScan):
+    def scan_callback(self, data: LaserScan):
         """
         Process incoming LIDAR scan data.
 
         Args:
             data (LaserScan): Raw LIDAR scan message
         """
-        self._raw_scan_msg = data 
+        self._raw_scan_msg = data
         latest_scan = reduce_lidar_scan(data.ranges)
 
         # bot_position = self.robot_pose
@@ -274,7 +336,6 @@ class REAL_ENV:
         #     self.cmd_vel_pub.publish(cmd)
         #     print("Collision detected!")
 
-
     def get_robot_pose_from_tf(self):
         """Get current robot pose from TF."""
         self.tf_listener.waitForTransform(
@@ -288,11 +349,127 @@ class REAL_ENV:
         print("TF Pose:", self.robot_pose, self.robot_yaw)
 
 
+    # CV sensor fusion
+    def _fuse_cv_with_lidar(self, lidar_scan: np.ndarray) -> np.ndarray:
+        """
+        Fuse the LiDAR scan with CV sector-range estimates.
+ 
+        The fused scan takes the element-wise minimum of both sources so the
+        RL policy always receives the most conservative distance estimate.
+        Sectors where CV has no estimate (np.inf) are unaffected.
+ 
+        Parameters
+        ----------
+        lidar_scan : np.ndarray
+            Downsampled LiDAR scan already aligned with the RL bin convention.
+            Shape must be (42,) - same as CVObstacleDetector.n_sectors.
+ 
+        Returns
+        -------
+        np.ndarray shape (42,)  fused distances in metres.
+        """
+        if self._cv is None:
+            return lidar_scan
+
+        cv_ranges = self._cv.get_sector_ranges()   # np.inf where no obstacle
+
+        # Replace np.inf in cv_ranges with a large value so np.minimum works cleanly
+        cv_safe = np.where(np.isinf(cv_ranges), 1e6, cv_ranges)
+        lidar_safe = np.where(np.isinf(lidar_scan), 1e6, lidar_scan)
+
+        fused = np.minimum(lidar_safe, cv_safe)
+
+        # Cap at 10 m to match the lidar max_range used downstream
+        fused = np.clip(fused, 0.0, 10.0)
+        return fused
+
+    def _try_calibrate_cv(self, lidar_scan: np.ndarray):
+        """
+        Perform one-shot CV scale calibration using the forward LiDAR arc.
+ 
+        Called once after the first step() when both a LiDAR scan and a MiDaS
+        depth map are available.
+ 
+        Parameters
+        ----------
+        lidar_scan : np.ndarray  shape (42,)
+            Binned LiDAR scan (metres, robot-frame centred).
+        """
+        if self._cv is None or self._cv_calibrated:
+            return
+
+        depth_map = self._cv.get_latest_depth_map()
+        if depth_map is None:
+            return   # MiDaS hasn't produced a frame yet - try again next step
+
+        # Forward arc = centre third of the scan (sectors 14..27 for 42 bins)
+        half = len(lidar_scan) // 2
+        third = len(lidar_scan) // 6
+        fwd_lidar = lidar_scan[half - third: half + third]
+        fwd_lidar = fwd_lidar[np.isfinite(fwd_lidar) & (fwd_lidar > 0.1)]
+        if len(fwd_lidar) == 0:
+            return
+
+        # Matching columns of the depth map (centre third of image width)
+        W = depth_map.shape[1]
+        col_start = W // 3
+        col_end = 2 * W // 3
+        # Ground rows are already excluded by CVObstacleDetector._ground_row
+        ground_row = self._cv._ground_row
+        fwd_depth = depth_map[:ground_row, col_start:col_end]
+        fwd_depth = fwd_depth[np.isfinite(fwd_depth) & (fwd_depth > 0)]
+        if len(fwd_depth) == 0:
+            return
+
+        lidar_med = float(np.median(fwd_lidar))
+        midas_med = float(np.median(fwd_depth))
+
+        self._cv.calibrate(lidar_med, midas_med)
+        self._cv_calibrated = True
+        rospy.loginfo(
+            f"[REAL_ENV] CV calibrated: lidar_fwd={lidar_med:.2f} m, "
+            f"midas_fwd={midas_med:.3f}"
+        )
+
+    # CV veto: override RL command if camera sees imminent obstacle
+    def _apply_cv_veto(self, lin_velocity: float, ang_velocity: float):
+        """
+        Check for a CV veto and return the (possibly overridden) velocity pair.
+ 
+        If the CV detector raises a veto, the linear velocity is zeroed and a
+        corrective angular velocity is issued.  LiDAR collision already stops
+        the robot; this catches obstacles the LiDAR misses (low objects,
+        glass, OOD obstacles).
+ 
+        Parameters
+        ----------
+        lin_velocity, ang_velocity : float
+            RL-commanded velocities.
+ 
+        Returns
+        -------
+        (float, float)  actual velocities to publish.
+        bool            True if veto was applied (for logging).
+        """
+        if self._cv is None:
+            return lin_velocity, ang_velocity, False
+
+        veto, veto_turn = self._cv.get_veto()
+        if veto:
+            rospy.logwarn_throttle(
+                0.5, "[REAL_ENV] CV VETO active — overriding RL command"
+            )
+            # Stop forward motion, steer away from obstacle
+            return 0.0, veto_turn, True
+
+        return lin_velocity, ang_velocity, False
+    
+
     # A* helpers
     def _build_and_plan(self):
         """
         Rebuild the occupancy grid from the current LiDAR scan and replan.
- 
+
         Safe to call even if no scan has arrived yet (produces an empty grid
         and falls back to a direct-to-goal path).
         """
@@ -333,7 +510,7 @@ class REAL_ENV:
         )
 
 
-    # When bot rached within the waypoint radius 
+    # When bot rached within the waypoint radius
     def _advance_waypoint_if_reached(self):
         """Advance waypoint index if robot is within waypoint_radius of current target."""
         if not self.waypoints or self.current_waypoint_index >= len(self.waypoints):
@@ -349,7 +526,6 @@ class REAL_ENV:
                 f"{self.current_waypoint_index + 1}/{len(self.waypoints)}"
             )
 
-
     # Internal utilities for robot
     def _stop_robot(self):
         cmd = Twist()
@@ -357,6 +533,8 @@ class REAL_ENV:
 
     @staticmethod
     def cossin(vec1, vec2):
+        vec1 = np.asarray(vec1, dtype=float)
+        vec2 = np.asarray(vec2, dtype=float)
         vec1 = vec1 / (np.linalg.norm(vec1) + 1e-9)
         vec2 = vec2 / (np.linalg.norm(vec2) + 1e-9)
         cos = np.dot(vec1, vec2)
@@ -385,9 +563,8 @@ class REAL_ENV:
             f"  Waypoints:    {self.current_waypoint_index + 1}/{len(self.waypoints)} reached"
         )
 
-
-
     # gym interface
+
     def step(self, lin_velocity=0.0, ang_velocity=0.1):
         """
         Execute one step in the environment.
@@ -406,7 +583,6 @@ class REAL_ENV:
             rospy.logwarn("Waiting for AMCL pose...")
             rospy.sleep(0.1)
             return None
-        
 
         # Periodic replan from latest scan
         if (
@@ -419,6 +595,9 @@ class REAL_ENV:
         # Advance to next waypoint if close enough
         self._advance_waypoint_if_reached()
 
+        # CV veto check — may override lin/ang velocity
+        actual_lin, actual_ang, veto_active = self._apply_cv_veto(
+            lin_velocity, ang_velocity)
 
         # Publish velocity command
         cmd = Twist()
@@ -428,6 +607,18 @@ class REAL_ENV:
             self.cmd_vel_pub.publish(cmd)
 
         rospy.sleep(0.1)  # Allow time for motion
+
+        # Fuse LiDAR + CV for the RL observation
+        # latest_scan may be empty on the very first step — guard with a fallback
+        if len(self.latest_scan) > 0:
+            lidar_arr=np.array(self.latest_scan, dtype=float)
+            fused_scan=self._fuse_cv_with_lidar(lidar_arr)
+        else:
+            fused_scan=np.full(42, 10.0)
+
+        # One-shot CV calibration
+        self._try_calibrate_cv(fused_scan)
+
 
         # metrics relative to current waypoint
         tx, ty = self.current_target
@@ -498,7 +689,7 @@ class REAL_ENV:
         action = [lin_velocity, ang_velocity]
         reward = 0  # Made for inference, not used
 
-        return self.latest_scan, distance, cos, sin, self.collision, goal, diff_rad, action, reward
+        return fused_scan, distance, cos, sin, self.collision, goal, diff_rad, action, reward
 
     def reset(self, goal_pose=None):
         """
@@ -529,6 +720,7 @@ class REAL_ENV:
         self.robot_goal = goal_pose
         self.collision = False
         self.goal_reached = False
+        self._cv_calibrated = False   # force recalibration for the new episode
 
         # wait for a fresh scan before planning
         rospy.sleep(0.3)
