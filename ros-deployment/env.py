@@ -34,10 +34,10 @@ class RobotNavEnv(gym.Env):
     [48]    sin(diff_rad)
     [49]    Waypoint progress  (waypoints completed / total)
     [50]    cos(waypoint direction, final-goal direction)
-    
+
     """
 
-    def __init__(self):
+    def __init__(self, use_cv:bool=True,cv_use_midas:bool=True ):
         super(RobotNavEnv, self).__init__()
         # Action space: [linear_velocity, angular_velocity]
         # Linear velocity range: [-0.6, 0.6] m/s
@@ -63,15 +63,15 @@ class RobotNavEnv(gym.Env):
         )
 
         # Initialize simulator with default goal
-        self.goal = [0, 0, 0]
-        self.sim = REAL_ENV(goal_pose=self.goal)
+        self.goal = [0.0, 0.0, 0.0]
+        self.sim = REAL_ENV(goal_pose=self.goal, use_cv=use_cv, cv_use_midas=cv_use_midas)
         self.time = 0
 
     # waypoint features
     def _waypoint_features(self):
         """
         Compute the two extra waypoint-progress observation features.
- 
+
         Returns
         -------
         waypoint_progress : float  [0, 1]
@@ -97,8 +97,7 @@ class RobotNavEnv(gym.Env):
 
         return waypoint_progress, wp_cos
 
-    
-
+    # state preparation
     def prepare_state(self, data):
         """
         Process raw environment data into a normalized state vector.
@@ -121,8 +120,9 @@ class RobotNavEnv(gym.Env):
         latest_scan = np.array(latest_scan)
 
         # Handle infinite values in LIDAR data
-        inf_mask = np.isinf(latest_scan)
-        latest_scan[inf_mask] = 10
+        # Clip infinite values
+        latest_scan[np.isinf(latest_scan)] = 10.0
+        latest_scan = np.clip(latest_scan, 0.0, 10.0)
 
         # Bin LIDAR data to reduce dimensionality
         max_bins = self.state_dim - 9
@@ -139,14 +139,13 @@ class RobotNavEnv(gym.Env):
 
         bin_size = int(len(latest_scan) / max_bins)
         min_values = []
-
         for i in range(0, len(latest_scan), bin_size):
             bin = latest_scan[i: i + min(bin_size, len(latest_scan) - i)]
             # Find the minimum value in the current bin and append it to the min_values list
             min_values.append(min(bin) / 10.0)
 
         # Normalize distance and velocities
-        distance_norm =distance/ 10.0
+        distance_norm = distance / 10.0
         lin_vel = (action[0] + 0.6) / 1.2
         ang_vel = (action[1] + 1.2) / 2.4
 
@@ -158,9 +157,9 @@ class RobotNavEnv(gym.Env):
         wp_progress, wp_cos = self._waypoint_features()
 
         # Combine all state components
-        state = min_values + [distance, cos, sin] + \
+        state = min_values + [distance_norm, cos, sin] + \
             [lin_vel, ang_vel] + [rad_cos, rad_sin] + [wp_progress, wp_cos]
-        assert len(state) == self.state_dim,(
+        assert len(state) == self.state_dim, (
             f"State length mismatch: expected {self.state_dim}, got {len(state)}"
         )
 
@@ -201,7 +200,7 @@ class RobotNavEnv(gym.Env):
         sim_data = self.sim.step(
             lin_velocity=lin_velocity, ang_velocity=ang_velocity)
         obs, terminal = self.prepare_state(sim_data)
-        reward = sim_data[-1]
+        reward = float(sim_data[-1])
 
         # Check termination conditions
         done = bool(terminal)
@@ -214,6 +213,8 @@ class RobotNavEnv(gym.Env):
         info = {
             "waypoints_total":   len(self.sim.waypoints),
             "waypoints_reached": self.sim.current_waypoint_index,
+            "cv_active":         self.sim._cv is not None,
+            "cv_calibrated":     self.sim._cv_calibrated,
         }
         self.current_obs = np.array(obs, dtype=np.float32)
         return self.current_obs, reward, done, info
